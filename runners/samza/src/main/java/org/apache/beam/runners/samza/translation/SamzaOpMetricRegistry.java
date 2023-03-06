@@ -28,51 +28,39 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
-import org.apache.beam.runners.samza.SamzaRunner;
-import org.apache.beam.sdk.metrics.Gauge;
-import org.apache.beam.sdk.metrics.Metrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-
+// Per Transform Metric Holder
 public class SamzaOpMetricRegistry implements Serializable {
   private static final Logger LOG = LoggerFactory.getLogger(SamzaOpMetricRegistry.class);
 
-  // pValue -> Map<watermarkId, avgStartTime>
-  private final ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>> avgStartTimeMap;
+  // transformName -> pValue/pCollection -> Map<watermarkId, avgArrivalTime>
+  private final ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>> avgStartTimeMapPerTranform;
 
   // transformName -> List<inputPCollections>,List<outputPCollections>
-  private final Map<String, Map.Entry<String, String>> transformNameToInputOutput;
+  //  private final Map.Entry<String, String> transformNameToInputOutput;
 
-  private final ConcurrentHashMap<String, Gauge> transformNameToLatency;
+  // tput metrics:
+  //private final ConcurrentHashMap<String, Counter> transformInputThroughPut;
+  //private final ConcurrentHashMap<String, Counter> transformOutputThroughPut;
 
   public SamzaOpMetricRegistry(Map<String, String> config) {
-    this.avgStartTimeMap = new ConcurrentHashMap<>();
-    TypeReference<Map<String, Map.Entry<String, String>>> typeRef =
-        new TypeReference<Map<String, Map.Entry<String,String>>>() {};
-    try {
-      ObjectMapper objectMapper = new ObjectMapper();
-      objectMapper.registerModule(
-          new SimpleModule().addDeserializer(Map.Entry.class, new SamzaPipelineTranslator.MapEntryDeserializer()));
-      this.transformNameToInputOutput =
-          objectMapper.readValue(
-              config.get(SamzaRunner.BEAM_TRANSFORMS_WITH_IO),
-              typeRef); // read from config deserialize
-    } catch (JsonProcessingException e) {
-      throw new RuntimeException(e);
-    }
-    this.transformNameToLatency = new ConcurrentHashMap<>();
+    avgStartTimeMapPerTranform = new ConcurrentHashMap<>();
+
     // init this metric map
-    transformNameToInputOutput
-        .keySet()
-        .forEach(
-            transform -> {
-              transformNameToLatency.put(
-                  transform, Metrics.gauge(SamzaMetricOp.class, transform + "-handle-message-ms"));
-            });
+//    transformNameToInputOutput
+//        .keySet()
+//        .forEach(
+//            transform -> {
+//              avgStartTimeMapPerTranform.put(transform, new ConcurrentHashMap<>());
+//              tranformToLatency.put(
+//                  transform, new Timer(transform + "-handle-message-ms"));
+//            });
   }
 
-  protected void updateAvgStartTimeMap(String pValue, long watermark, long avg) {
+  protected void updateAvgStartTimeMap(String transformName, String pValue, long watermark, long avg) {
+    ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>> avgStartTimeMap = avgStartTimeMapPerTranform.get(transformName);
     if (!avgStartTimeMap.containsKey(pValue)) {
       avgStartTimeMap.put(pValue, new ConcurrentHashMap<>());
     }
@@ -80,6 +68,8 @@ public class SamzaOpMetricRegistry implements Serializable {
   }
 
   protected void emitLatencyMetric(String transformName, Long watermark) {
+    ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>> avgStartTimeMap = avgStartTimeMapPerTranform.get(transformName);
+
     List<String> inputPValue = Arrays.stream(transformNameToInputOutput.get(transformName).getKey().split(",")).filter(item-> !item.isEmpty()).collect(Collectors.toList());
     List<String> outputPValue = Arrays.stream(transformNameToInputOutput.get(transformName).getValue().split(",")).filter(item-> !item.isEmpty()).collect(Collectors.toList());
 

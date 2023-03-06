@@ -172,7 +172,6 @@ public class SamzaRunner extends PipelineRunner<SamzaPipelineResult> {
         appDescriptor -> {
           appDescriptor.withApplicationContainerContextFactory(executionContext.new Factory());
           appDescriptor.withMetricsReporterFactories(reporterFactories);
-
           SamzaPipelineTranslator.translate(
               pipeline, new TranslationContext(appDescriptor, idMap, nonUniqueStateIds, options));
         };
@@ -181,6 +180,7 @@ public class SamzaRunner extends PipelineRunner<SamzaPipelineResult> {
     // generated
     SamzaPipelineOptionsValidator.validate(options);
     ApplicationRunner runner = runSamzaApp(app, config);
+
     return new SamzaPipelineResult(runner, executionContext, listener, config);
   }
 

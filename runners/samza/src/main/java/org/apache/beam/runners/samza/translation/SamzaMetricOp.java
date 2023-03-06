@@ -17,20 +17,30 @@
  */
 package org.apache.beam.runners.samza.translation;
 
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import org.apache.beam.runners.samza.runtime.KeyedTimerData;
 import org.apache.beam.runners.samza.runtime.Op;
 import org.apache.beam.runners.samza.runtime.OpEmitter;
 import org.apache.beam.sdk.util.WindowedValue;
+import org.apache.samza.config.Config;
+import org.apache.samza.context.Context;
+import org.apache.samza.metrics.MetricsRegistry;
+import org.apache.samza.operators.Scheduler;
 import org.joda.time.Instant;
 
-public class SamzaMetricOp<T> implements Op<T, T, Void> {
+public abstract class SamzaMetricOp<T> implements Op<T, T, Void> {
   private int count;
   private long sumOfTimestamps;
   private final String pValue;
   private final String transformFullName;
+  private MetricsRegistry metricsRegistry;
   private final SamzaOpMetricRegistry samzaOpMetricRegistry;
 
-  public SamzaMetricOp(
-      String pValue, String transformFullName, SamzaOpMetricRegistry samzaOpMetricRegistry) {
+  // transformName -> pValue/pCollection -> Map<watermarkId, avgArrivalTime>
+  ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>>
+
+  public SamzaMetricOp(String pValue, String transformFullName) {
     this.count = 0;
     this.sumOfTimestamps = 0L;
     this.pValue = pValue;
@@ -39,19 +49,35 @@ public class SamzaMetricOp<T> implements Op<T, T, Void> {
   }
 
   @Override
+  public void open(Config config, Context context, Scheduler<KeyedTimerData<Void>> timerRegistry,
+      OpEmitter<T> emitter) {
+    // read config to switch to per container metrics on demand
+    this.metricsRegistry = context.getContainerContext().getContainerMetricsRegistry();
+
+
+  }
+
+  @Override
   public void processElement(WindowedValue<T> inputElement, OpEmitter<T> emitter) {
-    // sum of count of elements
     count++;
-    // sum of arrival time - overflow exception sensitive
-    sumOfTimestamps = Math.addExact(sumOfTimestamps, System.currentTimeMillis());
+    try {
+      // sum of arrival time - overflow exception sensitive
+      sumOfTimestamps = Math.addExact(sumOfTimestamps, System.currentTimeMillis());
+    } catch ()
     emitter.emitElement(inputElement);
+
+    // KV<?,?> x = (KV<?, ?>) inputElement.getValue();
+    // System.out.println(String.format("[%s for %s] Element=%s Time=%s", pValue, transformFullName, x.getKey(), System.currentTimeMillis()));
+    // sum of count of elements
+
+
   }
 
   @Override
   public void processWatermark(Instant watermark, OpEmitter<T> emitter) {
     long avg = Math.floorDiv(sumOfTimestamps, count);
     // Update MetricOp Registry with counters
-    samzaOpMetricRegistry.updateAvgStartTimeMap(pValue, watermark.getMillis(), avg);
+    samzaOpMetricRegistry.updateAvgStartTimeMap(transformFullName, pValue, watermark.getMillis(), avg);
     // reset all counters
     count = 0;
     sumOfTimestamps = 0L;
