@@ -29,8 +29,22 @@ import org.joda.time.Instant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * SamzaOutputGBKMetricOp is a {@link SamzaMetricOp} that emits & maintains default metrics for
+ * output PCollection for GroupByKey. It emits the output throughput and maintains avg output time
+ * for output PCollection per windowId (). It is also responsible for emitting latency metric per
+ * windowId once the watermark passes the end of window timestamp.
+ *
+ * <p>Assumes that {@code SamzaOutputGBKMetricOp#processWatermark(Instant, OpEmitter)} is exclusive
+ * of {@code SamzaOutputGBKMetricOp#processElement(Instant, OpEmitter)}. Specifically, the
+ * processWatermark method assumes that no calls to processElement will be made during its
+ * execution, and vice versa.
+ *
+ * @param <T> The type of the elements in the output PCollection.
+ */
 public class SamzaOutputGBKMetricOp<T> extends SamzaMetricOp<T> {
   private static final Logger LOG = LoggerFactory.getLogger(SamzaOutputGBKMetricOp.class);
+  // Counters for keeping sum of arrival time and count of elements per windowId
   private Map<BoundedWindow, BigInteger> sumOfTimestampsPerWindowId;
   private Map<BoundedWindow, Long> sumOfCountPerWindowId;
 
@@ -43,11 +57,57 @@ public class SamzaOutputGBKMetricOp<T> extends SamzaMetricOp<T> {
 
   @Override
   public void processElement(WindowedValue<T> inputElement, OpEmitter<T> emitter) {
+    // one element can belong to multiple windows
     for (BoundedWindow windowId : inputElement.getWindows()) {
       updateCounters(windowId);
     }
-    samzaOpMetricRegistry.getSamzaOpMetrics().getTransformOutputThroughput(transformFullName).inc();
+
+    samzaOpMetricRegistry
+        .getTransformMetrics()
+        .getTransformOutputThroughput(transformFullName)
+        .inc();
     emitter.emitElement(inputElement);
+  }
+
+  @Override
+  public void processWatermark(Instant watermark, OpEmitter<T> emitter) {
+    List<BoundedWindow> closedWindows = new ArrayList<>();
+    sumOfCountPerWindowId.keySet().stream()
+        .filter(windowId -> watermark.isAfter(windowId.maxTimestamp())) // window is closed
+        .forEach(
+            windowId -> {
+              long sumOfTimestamps = sumOfTimestampsPerWindowId.get(windowId).longValue();
+              long count = sumOfCountPerWindowId.get(windowId);
+              closedWindows.add(windowId);
+
+              if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                    "Processing Output Watermark for Transform: {}, WindowId:{}, count: {}, sumOfTimestamps: {}, task: {}",
+                    transformFullName,
+                    windowId,
+                    count,
+                    sumOfTimestamps,
+                    task);
+              }
+
+              // if the window is closed and there is some data
+              if (sumOfTimestamps > 0 && count > 0) {
+                samzaOpMetricRegistry.emitLatencyMetric(
+                    transformFullName, windowId, Math.floorDiv(sumOfTimestamps, count), task);
+              }
+            });
+
+    // remove the closed windows
+    sumOfCountPerWindowId.keySet().removeAll(closedWindows);
+    sumOfTimestampsPerWindowId.keySet().removeAll(closedWindows);
+
+    // update the watermark progress metric
+    samzaOpMetricRegistry
+        .getTransformMetrics()
+        .getTransformWatermarkProgress(transformFullName)
+        .set(watermark.getMillis());
+
+    super.processWatermark(watermark, emitter);
   }
 
   private synchronized void updateCounters(BoundedWindow windowId) {
@@ -57,50 +117,5 @@ public class SamzaOutputGBKMetricOp<T> extends SamzaMetricOp<T> {
         windowId, sumTimestampsForId.add(BigInteger.valueOf(System.nanoTime())));
     Long count = sumOfCountPerWindowId.getOrDefault(windowId, 0L);
     sumOfCountPerWindowId.put(windowId, count + 1);
-  }
-
-  @Override
-  public void processWatermark(Instant watermark, OpEmitter<T> emitter) {
-    List<BoundedWindow> toBeRemoved = new ArrayList<>();
-    sumOfTimestampsPerWindowId.forEach(
-        (windowId, sumOfTimestamps) -> {
-          if (LOG.isDebugEnabled()) {
-            LOG.debug(
-                String.format(
-                    "Output [%s] Processing watermark: %s for task: %s",
-                    transformFullName,
-                    watermark.getMillis(),
-                    taskContext.getTaskModel().getTaskName().getTaskName()));
-          }
-          // cleanup Remove if sum of timestamps = 0 // no wateamark
-          if (watermark.isAfter(windowId.maxTimestamp())
-              && sumOfTimestamps.compareTo(BigInteger.ZERO) > 0) {
-            toBeRemoved.add(windowId);
-            samzaOpMetricRegistry.emitLatencyMetric(
-                transformFullName,
-                windowId,
-                Math.floorDiv(sumOfTimestamps.longValue(), sumOfCountPerWindowId.get(windowId)),
-                taskContext.getTaskModel().getTaskName().getTaskName());
-          } else {
-            // Empty data case - you don't need to handle
-            if (LOG.isDebugEnabled()) {
-              LOG.debug(
-                  String.format(
-                      "Output [%s] SumOfTimestamps: %s [zero or window not closed] for watermark: %s for task: %s",
-                      transformFullName,
-                      sumOfTimestamps.longValue(),
-                      watermark.getMillis(),
-                      taskContext.getTaskModel().getTaskName().getTaskName()));
-            }
-          }
-        });
-
-    toBeRemoved.forEach(
-        window -> {
-          sumOfTimestampsPerWindowId.remove(window);
-          sumOfCountPerWindowId.remove(window);
-        });
-
-    super.processWatermark(watermark, emitter);
   }
 }

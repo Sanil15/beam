@@ -21,22 +21,28 @@ import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.io.Serializable;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import org.apache.samza.context.Context;
 import org.apache.samza.metrics.Counter;
 import org.apache.samza.metrics.Gauge;
 import org.apache.samza.metrics.MetricsRegistry;
+import org.apache.samza.metrics.SlidingTimeWindowReservoir;
 import org.apache.samza.metrics.Timer;
 
-// Todo check per container vs per task wiring of this
-// Can this be static
-public class SamzaOpMetricHolder implements Serializable {
-  private static final String GROUP = SamzaOpMetricHolder.class.getSimpleName();
+/**
+ * Metrics like throughput, latency and watermark progress for each Beam transform for Samza Runner.
+ */
+public class BeamTransformMetrics implements Serializable {
+  private static final String ENABLE_TASK_METRICS = "runner.samza.transform.enable.task.metrics";
 
+  private static final int DEFAULT_LOOKBACK_TIMER_WINDOW_SIZE_MS = 180000;
+  private static final String GROUP = "BeamTransformMetrics";
   private static final String METRIC_NAME_PATTERN = "%s-%s";
   private static final String TRANSFORM_LATENCY_METRIC = "handle-message-ns";
-  private static final String TRANSFORM_WATERMARK_PROGRESS = "watermark-progress";
+  private static final String TRANSFORM_WATERMARK_PROGRESS = "output-watermark-ms";
   private static final String TRANSFORM_IP_THROUGHPUT = "num-input-messages";
   private static final String TRANSFORM_OP_THROUGHPUT = "num-output-messages";
 
+  // Transform name to metric maps
   @SuppressFBWarnings("SE_BAD_FIELD")
   private final Map<String, Timer> transformLatency;
 
@@ -49,19 +55,34 @@ public class SamzaOpMetricHolder implements Serializable {
   @SuppressFBWarnings("SE_BAD_FIELD")
   private final Map<String, Counter> transformOutputThroughPut;
 
-  public SamzaOpMetricHolder() {
+  public BeamTransformMetrics() {
     this.transformLatency = new ConcurrentHashMap<>();
     this.transformOutputThroughPut = new ConcurrentHashMap<>();
     this.transformWatermarkProgress = new ConcurrentHashMap<>();
     this.transformInputThroughput = new ConcurrentHashMap<>();
   }
 
-  public void register(String transformName, MetricsRegistry metricsRegistry) {
-    // TODO: Check the length of metric name is not exceeding the ingraphs limit defined
+  public void register(String transformName, Context ctx) {
+    // Output Watermark metric per transform will always be per tranform, per task, since per
+    // container
+    // output watermark is not useful for debugging
+    transformWatermarkProgress.putIfAbsent(
+        transformName,
+        ctx.getTaskContext()
+            .getTaskMetricsRegistry()
+            .newGauge(
+                GROUP, getMetricNameWithPrefix(TRANSFORM_WATERMARK_PROGRESS, transformName), 0L));
+
+    // Latency, throughput metrics can be per container (default) or per task
+    final boolean enablePerTaskMetrics =
+        ctx.getJobContext().getConfig().getBoolean(ENABLE_TASK_METRICS, false);
+    final MetricsRegistry metricsRegistry =
+        enablePerTaskMetrics
+            ? ctx.getTaskContext().getTaskMetricsRegistry()
+            : ctx.getContainerContext().getContainerMetricsRegistry();
     transformLatency.putIfAbsent(
         transformName,
-        metricsRegistry.newTimer(
-            GROUP, getMetricNameWithPrefix(TRANSFORM_LATENCY_METRIC, transformName)));
+        metricsRegistry.newTimer(GROUP, getTimerWithCustomizedLookbackWindow(transformName)));
     transformOutputThroughPut.putIfAbsent(
         transformName,
         metricsRegistry.newCounter(
@@ -70,29 +91,36 @@ public class SamzaOpMetricHolder implements Serializable {
         transformName,
         metricsRegistry.newCounter(
             GROUP, getMetricNameWithPrefix(TRANSFORM_IP_THROUGHPUT, transformName)));
-    transformWatermarkProgress.putIfAbsent(
-        transformName,
-        metricsRegistry.newGauge(
-            GROUP, getMetricNameWithPrefix(TRANSFORM_WATERMARK_PROGRESS, transformName), 0L));
   }
 
-  private static String getMetricNameWithPrefix(String metricName, String transformName) {
-    return String.format(METRIC_NAME_PATTERN, transformName, metricName);
-  }
-
-  public Timer getTransformLatencyMetric(String transformName) {
+  Timer getTransformLatencyMetric(String transformName) {
     return transformLatency.get(transformName);
   }
 
-  public Counter getTransformInputThroughput(String transformName) {
+  Counter getTransformInputThroughput(String transformName) {
     return transformInputThroughput.get(transformName);
   }
 
-  public Counter getTransformOutputThroughput(String transformName) {
+  Counter getTransformOutputThroughput(String transformName) {
     return transformOutputThroughPut.get(transformName);
   }
 
-  public Gauge<Long> getTransformWatermarkProgress(String transformName) {
+  Gauge<Long> getTransformWatermarkProgress(String transformName) {
     return transformWatermarkProgress.get(transformName);
+  }
+
+  // customize lookback window size for timer, default from samza is 5 mins which causes memory
+  // pressure
+  // if a lot of timers are registered
+  private static Timer getTimerWithCustomizedLookbackWindow(String transformName) {
+    return new Timer(
+        getMetricNameWithPrefix(TRANSFORM_LATENCY_METRIC, transformName),
+        new SlidingTimeWindowReservoir(DEFAULT_LOOKBACK_TIMER_WINDOW_SIZE_MS));
+  }
+
+  private static String getMetricNameWithPrefix(String metricName, String transformName) {
+    // Replace all non-alphanumeric characters with underscore
+    final String samzaSafeMetricName = transformName.replaceAll("[^A-Za-z0-9_]", "_");
+    return String.format(METRIC_NAME_PATTERN, samzaSafeMetricName, metricName);
   }
 }

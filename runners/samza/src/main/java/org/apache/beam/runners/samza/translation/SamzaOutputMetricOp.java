@@ -26,9 +26,21 @@ import org.joda.time.Instant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * SamzaOutputMetricOp is a {@link SamzaMetricOp} that emits & maintains default transform metrics
+ * for output PCollection to the transform. It emits the output throughput and maintains avg output
+ * time for output PCollection per watermark.
+ *
+ * <p>Assumes that {@code SamzaOutputMetricOp#processWatermark(Instant, OpEmitter)} is exclusive of
+ * {@code SamzaOutputMetricOp#processElement(Instant, OpEmitter)}. Specifically, the
+ * processWatermark method assumes that no calls to processElement will be made during its
+ * execution, and vice versa.
+ *
+ * @param <T> The type of the elements in the output PCollection.
+ */
 public class SamzaOutputMetricOp<T> extends SamzaMetricOp<T> {
   private static final Logger LOG = LoggerFactory.getLogger(SamzaOutputMetricOp.class);
-
+  // Counters for output throughput
   private AtomicLong count;
   private AtomicReference<BigInteger> sumOfTimestamps;
 
@@ -44,7 +56,10 @@ public class SamzaOutputMetricOp<T> extends SamzaMetricOp<T> {
     // update counters for timestamps
     count.incrementAndGet();
     sumOfTimestamps.updateAndGet(sum -> sum.add(BigInteger.valueOf(System.nanoTime())));
-    samzaOpMetricRegistry.getSamzaOpMetrics().getTransformOutputThroughput(transformFullName).inc();
+    samzaOpMetricRegistry
+        .getTransformMetrics()
+        .getTransformOutputThroughput(transformFullName)
+        .inc();
     emitter.emitElement(inputElement);
   }
 
@@ -53,41 +68,32 @@ public class SamzaOutputMetricOp<T> extends SamzaMetricOp<T> {
   public void processWatermark(Instant watermark, OpEmitter<T> emitter) {
     if (LOG.isDebugEnabled()) {
       LOG.debug(
-          String.format(
-              "Output [%s] Processing watermark: %s for task: %s",
-              transformFullName,
-              watermark.getMillis(),
-              taskContext.getTaskModel().getTaskName().getTaskName()));
+          "Processing Output Watermark for Transform: {} Count: {} SumOfTimestamps: {} for Watermark: {} for Task: {}",
+          transformFullName,
+          count.get(),
+          sumOfTimestamps.get().longValue(),
+          watermark.getMillis(),
+          task);
     }
-    if (sumOfTimestamps.get().compareTo(BigInteger.ZERO) > 0) {
+
+    // if there is no input data then counters will be zero and only watermark will progress
+    if (count.get() > 0) {
       // if BigInt.longValue is out of range for long then only the low-order 64 bits are retained
       long avg = Math.floorDiv(sumOfTimestamps.get().longValue(), count.get());
-      // Update MetricOp Registry with counters
+      // Update MetricOp Registry with avg arrival for the pValue
       samzaOpMetricRegistry.updateArrivalTimeMap(
           transformFullName, pValue, watermark.getMillis(), avg);
-      // emit the metrics
+      // compute & emit the latency metric
       samzaOpMetricRegistry.emitLatencyMetric(
-          transformFullName,
-          transformInputs,
-          transformOutputs,
-          watermark.getMillis(),
-          taskContext.getTaskModel().getTaskName().getTaskName());
-    } else {
-      // Empty data case - you don't need to handle
-      if (LOG.isDebugEnabled()) {
-        LOG.debug(
-            String.format(
-                "Output [%s] SumOfTimestamps: %s zero for watermark: %s for task: %s",
-                transformFullName,
-                sumOfTimestamps.get().longValue(),
-                watermark.getMillis(),
-                taskContext.getTaskModel().getTaskName().getTaskName()));
-      }
+          transformFullName, transformInputs, transformOutputs, watermark.getMillis(), task);
     }
+
+    // update output watermark progress metric
     samzaOpMetricRegistry
-        .getSamzaOpMetrics()
+        .getTransformMetrics()
         .getTransformWatermarkProgress(transformFullName)
         .set(watermark.getMillis());
+
     // reset all counters
     this.count = new AtomicLong(0L);
     this.sumOfTimestamps = new AtomicReference<>(BigInteger.ZERO);

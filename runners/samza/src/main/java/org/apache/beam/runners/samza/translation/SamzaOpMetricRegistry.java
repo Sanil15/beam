@@ -24,40 +24,50 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
-import org.apache.samza.metrics.MetricsRegistry;
+import org.apache.samza.context.Context;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * SamzaOpMetricRegistry is a registry that maintains the metrics for each transform. It maintains
+ * the average arrival time for each PCollection for a primitive transform.
+ *
+ * <p>For a non-data shuffling primitive transform, the average arrival time is calculated per
+ * watermark, per PCollection {@link org.apache.beam.sdk.values.PValue}.
+ *
+ * <p>For data-shuffling i.e. GroupByKey, the average arrival time is calculated per windowId {@link
+ * org.apache.beam.sdk.transforms.windowing.BoundedWindow}.
+ */
 public class SamzaOpMetricRegistry implements Serializable {
   private static final Logger LOG = LoggerFactory.getLogger(SamzaOpMetricRegistry.class);
 
-  // transformName -> pValue/pCollection -> Map<watermarkId, avgArrivalTime>
+  // TransformName -> PValue for pCollection -> Map<WatermarkId, AvgArrivalTime>
   private ConcurrentHashMap<String, ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>>>
       avgArrivalTimeMap;
-  // transformName -> <windowId, avgArrivalTime>
+  // TransformName -> Map<WindowId, AvgArrivalTime>
   @SuppressFBWarnings("SE_BAD_FIELD")
   private ConcurrentHashMap<String, ConcurrentHashMap<BoundedWindow, Long>> avgArrivalTimeMapForGbk;
 
-  private final SamzaOpMetricHolder samzaOpMetricHolder;
+  // Per Transform Metrics for each primitive transform
+  private final BeamTransformMetrics transformMetrics;
 
   public SamzaOpMetricRegistry() {
     this.avgArrivalTimeMap = new ConcurrentHashMap<>();
     this.avgArrivalTimeMapForGbk = new ConcurrentHashMap<>();
-    this.samzaOpMetricHolder = new SamzaOpMetricHolder();
+    this.transformMetrics = new BeamTransformMetrics();
   }
 
-  public void register(String transformFullName, String pValue, MetricsRegistry metricsRegistry) {
-    samzaOpMetricHolder.register(transformFullName, metricsRegistry);
+  public void register(String transformFullName, String pValue, Context ctx) {
+    transformMetrics.register(transformFullName, ctx);
     avgArrivalTimeMap.putIfAbsent(transformFullName, new ConcurrentHashMap<>());
-    ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>> avgStartMap =
-        avgArrivalTimeMap.get(transformFullName);
-    avgStartMap.putIfAbsent(pValue, new ConcurrentHashMap<>());
-    // todo: check if somehow we can only update this for GroupByKey/Combine
+    avgArrivalTimeMap.get(transformFullName).putIfAbsent(pValue, new ConcurrentHashMap<>());
+    // Populate GBK map as well since we cannot distinguish a window and non-window operator using
+    // transformName
     avgArrivalTimeMapForGbk.putIfAbsent(transformFullName, new ConcurrentHashMap<>());
   }
 
-  public SamzaOpMetricHolder getSamzaOpMetrics() {
-    return samzaOpMetricHolder;
+  BeamTransformMetrics getTransformMetrics() {
+    return transformMetrics;
   }
 
   protected void updateArrivalTimeMap(String transformName, BoundedWindow windowId, long avg) {
@@ -76,9 +86,9 @@ public class SamzaOpMetricRegistry implements Serializable {
   }
 
   void emitLatencyMetric(
-      String transformName, BoundedWindow w, Long avgArrivalEndTime, String taskName) {
-    Long avgArrivalStartTime = avgArrivalTimeMapForGbk.get(transformName).getOrDefault(w, 0L);
-    if (avgArrivalStartTime.compareTo(0L) > 0 && avgArrivalEndTime.compareTo(0L) > 0) {
+      String transformName, BoundedWindow w, long avgArrivalEndTime, String taskName) {
+    Long avgArrivalStartTime = avgArrivalTimeMapForGbk.get(transformName).remove(w);
+    if (avgArrivalStartTime != null && avgArrivalStartTime > 0 && avgArrivalEndTime > 0) {
       if (LOG.isDebugEnabled()) {
         LOG.debug(
             String.format(
@@ -86,7 +96,7 @@ public class SamzaOpMetricRegistry implements Serializable {
                 transformName, transformName, w, taskName));
       }
       avgArrivalTimeMapForGbk.get(transformName).remove(w);
-      samzaOpMetricHolder
+      transformMetrics
           .getTransformLatencyMetric(transformName)
           .update(avgArrivalEndTime - avgArrivalStartTime);
     } else {
@@ -139,7 +149,7 @@ public class SamzaOpMetricRegistry implements Serializable {
                   transformName, transformName, watermark, taskName));
         }
         Long avgLatency = endTime - startTime;
-        samzaOpMetricHolder.getTransformLatencyMetric(transformName).update(avgLatency);
+        transformMetrics.getTransformLatencyMetric(transformName).update(avgLatency);
       } else {
         if (LOG.isDebugEnabled()) {
           LOG.debug(

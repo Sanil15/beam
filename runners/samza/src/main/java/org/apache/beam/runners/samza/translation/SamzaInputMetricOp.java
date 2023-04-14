@@ -26,9 +26,20 @@ import org.joda.time.Instant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * SamzaInputMetricOp is a {@link SamzaMetricOp} that emits & maintains default transform metrics
+ * for input PCollection to the transform. It emits the input throughput and maintains avg arrival
+ * time for input PCollection per watermark.
+ *
+ * <p>Assumes that {@code SamzaInputMetricOp#processWatermark(Instant, OpEmitter)} is exclusive of
+ * {@code SamzaInputMetricOp#processElement(Instant, OpEmitter)}. Specifically, the processWatermark
+ * method assumes that no calls to processElement will be made during its execution, and vice versa.
+ *
+ * @param <T> The type of the elements in the input PCollection.
+ */
 public class SamzaInputMetricOp<T> extends SamzaMetricOp<T> {
   private static final Logger LOG = LoggerFactory.getLogger(SamzaInputMetricOp.class);
-
+  // Counters to maintain avg arrival time per watermark for input PCollection.
   private AtomicLong count;
   private AtomicReference<BigInteger> sumOfTimestamps;
 
@@ -43,38 +54,30 @@ public class SamzaInputMetricOp<T> extends SamzaMetricOp<T> {
   public void processElement(WindowedValue<T> inputElement, OpEmitter<T> emitter) {
     count.incrementAndGet();
     sumOfTimestamps.updateAndGet(sum -> sum.add(BigInteger.valueOf(System.nanoTime())));
-    samzaOpMetricRegistry.getSamzaOpMetrics().getTransformInputThroughput(transformFullName).inc();
+    samzaOpMetricRegistry
+        .getTransformMetrics()
+        .getTransformInputThroughput(transformFullName)
+        .inc();
     emitter.emitElement(inputElement);
   }
 
   @Override
-  @SuppressWarnings({"CompareToZero"})
   public void processWatermark(Instant watermark, OpEmitter<T> emitter) {
     if (LOG.isDebugEnabled()) {
       LOG.debug(
-          String.format(
-              "Input [%s] Processing watermark: %s for task: %s",
-              transformFullName,
-              watermark.getMillis(),
-              taskContext.getTaskModel().getTaskName().getTaskName()));
+          "Processing Input Watermark for Transform: {} Count: {} SumOfTimestamps: {} for Watermark: {} for Task: {}",
+          transformFullName,
+          count.get(),
+          sumOfTimestamps.get().longValue(),
+          watermark.getMillis(),
+          task);
     }
-    // if there is no data then counters will be zero and only watermark will progress
-    if (sumOfTimestamps.get().compareTo(BigInteger.ZERO) > 0) {
+    // if there is no input data then counters will be zero and only watermark will progress
+    if (count.get() > 0) {
       // if BigInt.longValue is out of range for long then only the low-order 64 bits are retained
       long avg = Math.floorDiv(sumOfTimestamps.get().longValue(), count.get());
       samzaOpMetricRegistry.updateArrivalTimeMap(
           transformFullName, pValue, watermark.getMillis(), avg);
-    } else {
-      // Empty data case - you don't need to handle
-      if (LOG.isDebugEnabled()) {
-        LOG.debug(
-            String.format(
-                "Input [%s] SumOfTimestamps: %s zero for watermark: %s for task: %s",
-                transformFullName,
-                sumOfTimestamps.get().longValue(),
-                watermark.getMillis(),
-                taskContext.getTaskModel().getTaskName().getTaskName()));
-      }
     }
     // reset all counters
     this.count = new AtomicLong(0L);
